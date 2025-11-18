@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  czds-utils:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: czds-utils:latest
+    container_name: czds-utils
+
+    # Security settings
+    user: "1000:1000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Environment configuration
+    env_file:
+      - .env
+
+    environment:
+      - DATABASE_PATH=/data/czds.db
+      - LOG_FILE=/logs/czds_utils.log
+      - ZONE_FILES_DIR=/zone_files
+
+    # Volumes for data persistence
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./zone_files:/zone_files
+      - /tmp:/tmp
+
+    # Network settings
+    networks:
+      - czds-network
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Override command for interactive use
+    # command: ["stats"]
+
+networks:
+  czds-network:
+    driver: bridge

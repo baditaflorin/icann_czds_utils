@@ -16,6 +16,15 @@ def temp_dir():
         yield Path(tmpdir)
 
 
+@pytest.fixture(autouse=True)
+def clean_env():
+    """Ensure environment variables are restored after each test."""
+    old_env = os.environ.copy()
+    yield
+    os.environ.clear()
+    os.environ.update(old_env)
+
+
 @pytest.fixture
 def test_env_file(temp_dir):
     """Create a test .env file."""

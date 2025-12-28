@@ -107,7 +107,10 @@ See `.env.example` for all available settings.
 Launch the graphical interface:
 
 ```bash
+make run
+# or
 make gui
+# or
 # or
 python -m czds_utils.gui.main_window
 ```

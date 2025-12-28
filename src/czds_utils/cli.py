@@ -33,6 +33,7 @@ def cmd_authenticate(args):
         config.CZDS_API_BASE_URL,
         config.CZDS_USERNAME,
         config.CZDS_PASSWORD,
+        auth_url=config.CZDS_AUTH_URL,
         timeout=config.REQUEST_TIMEOUT,
         max_retries=config.MAX_RETRIES,
         validate_ssl=config.VALIDATE_SSL
@@ -51,6 +52,7 @@ def cmd_list_zones(args):
         config.CZDS_API_BASE_URL,
         config.CZDS_USERNAME,
         config.CZDS_PASSWORD,
+        auth_url=config.CZDS_AUTH_URL,
         timeout=config.REQUEST_TIMEOUT,
         max_retries=config.MAX_RETRIES,
         validate_ssl=config.VALIDATE_SSL
@@ -73,6 +75,7 @@ def cmd_download(args):
         config.CZDS_API_BASE_URL,
         config.CZDS_USERNAME,
         config.CZDS_PASSWORD,
+        auth_url=config.CZDS_AUTH_URL,
         timeout=config.REQUEST_TIMEOUT,
         max_retries=config.MAX_RETRIES,
         validate_ssl=config.VALIDATE_SSL

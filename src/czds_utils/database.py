@@ -198,6 +198,7 @@ class Database:
         """
         # Validate input
         key = Validators.validate_string(key, 'metadata_key', max_length=100)
+        Validators.check_sql_injection(key, 'metadata_key')
 
         with self._get_connection() as conn:
             # Parameterized query

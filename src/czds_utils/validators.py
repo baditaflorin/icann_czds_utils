@@ -27,8 +27,9 @@ class Validators:
     # Dangerous patterns to block
     SQL_INJECTION_PATTERNS = [
         r"(\bUNION\b|\bSELECT\b|\bINSERT\b|\bUPDATE\b|\bDELETE\b|\bDROP\b)",
-        r"(;|\-\-|\/\*|\*\/)",
-        r"(\bOR\b\s+[\d'\"]+\s*=\s*[\d'\"]+)",  # Matches both OR 1=1 and OR '1'='1'
+        r"(;|\-\-|\/\*|\*\/|\|\|)",  # Added ||
+        r"(\bOR\b\s+[\d'\"]+\s*=\s*[\d'\"]+)",
+        r"(0x[0-9a-fA-F]+)",  # Hex encoding
     ]
 
     PATH_TRAVERSAL_PATTERNS = [

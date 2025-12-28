@@ -28,6 +28,7 @@ class CZDSClient:
         base_url: str,
         username: str,
         password: str,
+        auth_url: Optional[str] = None,
         timeout: int = 30,
         max_retries: int = 3,
         validate_ssl: bool = True
@@ -38,6 +39,7 @@ class CZDSClient:
             base_url: Base URL for CZDS API (validated)
             username: CZDS username (validated)
             password: CZDS password
+            auth_url: Base URL for Authentication API (optional, validated)
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
             validate_ssl: Whether to validate SSL certificates
@@ -47,6 +49,13 @@ class CZDSClient:
         """
         # Validate inputs
         self.base_url = Validators.validate_url(base_url, 'base_url').rstrip('/')
+        
+        # Validate auth_url if provided, otherwise default to base_url (for backward compatibility)
+        if auth_url:
+            self.auth_url = Validators.validate_url(auth_url, 'auth_url').rstrip('/')
+        else:
+            self.auth_url = self.base_url
+
         self.username = Validators.validate_username(username, 'username')
 
         if not password:
@@ -92,7 +101,7 @@ class CZDSClient:
         Raises:
             APIError: If authentication fails
         """
-        url = f"{self.base_url}{self.AUTHENTICATE_ENDPOINT}"
+        url = f"{self.auth_url}{self.AUTHENTICATE_ENDPOINT}"
 
         # Prepare authentication payload
         payload = {
@@ -124,7 +133,12 @@ class CZDSClient:
                 )
 
             # Extract access token from response
-            self._access_token = response.text.strip()
+            try:
+                data = response.json()
+                self._access_token = data.get("accessToken")
+            except ValueError:
+                # Fallback if valid JSON is not returned, though unlikely
+                self._access_token = response.text.strip()
 
             if not self._access_token:
                 raise APIError(

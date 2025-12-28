@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Any, Dict
 from dotenv import load_dotenv
 
-from czds_utils.errors import ConfigurationError
+from czds_utils.errors import ConfigurationError, ValidationError
 from czds_utils.validators import Validators
 
 
@@ -25,6 +25,7 @@ class Config:
     # Default values for optional settings
     DEFAULTS = {
         'CZDS_API_BASE_URL': 'https://czds-api.icann.org',
+        'CZDS_AUTH_URL': 'https://account-api.icann.org',
         'DATABASE_PATH': './data/czds.db',
         'DATABASE_TIMEOUT': '30',
         'LOG_LEVEL': 'INFO',
@@ -143,6 +144,15 @@ class Config:
             )
         except Exception as e:
             raise ConfigurationError(str(e), 'CZDS_API_BASE_URL')
+
+        # Validate Auth URL
+        try:
+            Validators.validate_url(
+                self._config['CZDS_AUTH_URL'],
+                'CZDS_AUTH_URL'
+            )
+        except Exception as e:
+            raise ConfigurationError(str(e), 'CZDS_AUTH_URL')
 
         # Validate integer settings
         int_settings = {
@@ -278,6 +288,8 @@ class Config:
             return Validators.validate_username(value, key)
         elif key == 'CZDS_API_BASE_URL':
             return Validators.validate_url(value, key)
+        elif key == 'CZDS_AUTH_URL':
+            return Validators.validate_url(value, key)
         elif key in ['DATABASE_TIMEOUT', 'MAX_RETRIES', 'REQUEST_TIMEOUT']:
             return Validators.validate_integer(value, key, min_value=1, max_value=300)
         else:
@@ -294,8 +306,11 @@ class Config:
         Raises:
             ConfigurationError: If value is invalid
         """
-        validated_value = self.validate_runtime_value(key, value)
-        self._config[key] = validated_value
+        try:
+            validated_value = self.validate_runtime_value(key, value)
+            self._config[key] = validated_value
+        except ValidationError as e:
+            raise ConfigurationError(e.safe_message, key)
 
 
 # Global configuration instance

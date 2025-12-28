@@ -6,8 +6,10 @@ with comprehensive input validation and error handling.
 
 import gzip
 import logging
+import socket
+import concurrent.futures
 from pathlib import Path
-from typing import Iterator, Optional, Set
+from typing import Iterator, Optional, Set, Callable
 from collections import Counter
 
 from czds_utils.errors import ParseError, ValidationError
@@ -29,30 +31,35 @@ class ZoneFileParser:
     # Maximum file size to process (in bytes)
     MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10 GB
 
-    def __init__(self, tld: str, validate_domains: bool = True):
+    def __init__(self, tld: str, validate_domains: bool = True, check_active: bool = False, concurrency: int = 50):
         """Initialize zone file parser.
 
         Args:
             tld: TLD being parsed (validated)
             validate_domains: Whether to validate each domain
-
-        Raises:
-            ValidationError: If TLD is invalid
+            check_active: Whether to check if domain resolves (DNS)
+            concurrency: Number of parallel threads for active checks
         """
         self.tld = Validators.validate_tld(tld, 'tld')
         self.validate_domains = validate_domains
+        self.check_active = check_active
+        self.concurrency = concurrency
         self._logger = logging.getLogger(__name__)
 
     def parse_file(
         self,
         file_path: Path,
-        max_domains: Optional[int] = None
+        max_domains: Optional[int] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None
     ) -> Iterator[str]:
         """Parse a zone file and yield domain names.
 
         Args:
             file_path: Path to zone file (plain or gzipped)
             max_domains: Maximum number of domains to parse (for testing)
+            progress_callback: Callback receiving total lines processed
+            should_stop: Callback returning True if parsing should abort
 
         Yields:
             Valid domain names
@@ -92,7 +99,7 @@ class ZoneFileParser:
 
             if is_gzipped:
                 with gzip.open(file_path, 'rt', encoding='utf-8', errors='replace') as f:
-                    for domain in self._parse_stream(f):
+                    for domain in self._parse_stream(f, progress_callback, should_stop):
                         yield domain
                         domains_parsed += 1
 
@@ -101,7 +108,7 @@ class ZoneFileParser:
                             break
             else:
                 with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                    for domain in self._parse_stream(f):
+                    for domain in self._parse_stream(f, progress_callback, should_stop):
                         yield domain
                         domains_parsed += 1
 
@@ -118,11 +125,18 @@ class ZoneFileParser:
         except Exception as e:
             raise ParseError(f"Unexpected error while parsing: {str(e)}")
 
-    def _parse_stream(self, stream) -> Iterator[str]:
+    def _parse_stream(
+        self,
+        stream,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None
+    ) -> Iterator[str]:
         """Parse zone data from a stream.
 
         Args:
             stream: File-like object to read from
+            progress_callback: Callback receiving total lines processed
+            should_stop: Callback returning True if parsing should abort
 
         Yields:
             Valid domain names
@@ -135,7 +149,18 @@ class ZoneFileParser:
         max_invalid = 1000  # Stop if too many invalid lines
 
         for line in stream:
+            # Check for cancellation
+            if should_stop and should_stop():
+                self._logger.info("Parsing cancelled by user")
+                return
+
             line_number += 1
+
+            # Report progress periodically (every 100 lines or so to avoid overhead)
+            # or just every line if checking active, since that's slow.
+            # Let's report every line for smoothing UI updates.
+            if progress_callback:
+                progress_callback(line_number)
 
             # Security check: limit line length
             if len(line) > self.MAX_LINE_LENGTH:
@@ -173,6 +198,15 @@ class ZoneFileParser:
                                 )
                             continue
 
+                            continue
+
+                    # Active check (DNS resolution)
+                    if self.check_active:
+                        if not self._is_active(domain):
+                            # Skip inactive domains silently (or log debug)
+                            self._logger.debug(f"Domain {domain} is inactive (NXDOMAIN)")
+                            continue
+
                     yield domain
 
             except Exception as e:
@@ -185,6 +219,24 @@ class ZoneFileParser:
                         f"Too many parse errors (>{max_invalid})",
                         line_number=line_number
                     )
+
+    def _is_active(self, domain: str) -> bool:
+        """Check if domain resolves to an IP active address.
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            True if resolves, False otherwise
+        """
+        try:
+            # Try to resolve A record (IPv4)
+            socket.getaddrinfo(domain, None, socket.AF_INET, socket.SOCK_STREAM)
+            return True
+        except socket.gaierror:
+            return False
+        except Exception:
+            return False
 
     def _extract_domain(self, line: str) -> Optional[str]:
         """Extract domain name from a zone file line.
@@ -290,6 +342,40 @@ class ZoneFileParser:
             }
 
         return stats
+
+
+    def count_lines(self, file_path: Path) -> int:
+        """Count total lines in a file efficiently.
+
+        Args:
+            file_path: Path to file
+
+        Returns:
+            Total line count
+        """
+        def blocks(f, size=65536):
+            while True:
+                b = f.read(size)
+                if not b: break
+                yield b
+
+        count = 0
+        is_gzipped = file_path.suffix.lower() in ['.gz', '.gzip']
+
+        try:
+            if is_gzipped:
+                with gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore') as f:
+                    for block in blocks(f):
+                        count += block.count('\n')
+            else:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for block in blocks(f):
+                        count += block.count('\n')
+            
+            return count
+        except Exception as e:
+            self._logger.warning(f"Failed to count lines: {e}")
+            return 0
 
 
 def extract_unique_domains(

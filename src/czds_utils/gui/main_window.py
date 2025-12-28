@@ -219,7 +219,7 @@ class CZDSUtilsGUI:
         tld_frame.pack(fill='x', padx=5, pady=5)
 
         ttk.Label(tld_frame, text="TLD:").pack(side='left', padx=5)
-        self.tld_entry = ttk.Entry(tld_frame, width=10)
+        self.tld_entry = ttk.Combobox(tld_frame, width=10)
         self.tld_entry.pack(side='left', padx=5)
 
         ttk.Button(
@@ -273,11 +273,33 @@ class CZDSUtilsGUI:
             variable=self.validate_domains_var
         ).pack(side='left', padx=5)
 
-        ttk.Button(
+        self.check_active_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            options_frame,
+            text="Check Connectivity",
+            variable=self.check_active_var
+        ).pack(side='left', padx=5)
+
+        self.parse_button = ttk.Button(
             options_frame,
             text="Parse & Import to DB",
             command=self.parse_and_import
-        ).pack(side='left', padx=5)
+        )
+        self.parse_button.pack(side='left', padx=5)
+
+        self.cancel_button = ttk.Button(
+            options_frame,
+            text="Cancel",
+            command=self.cancel_import,
+            state='disabled'
+        )
+        self.cancel_button.pack(side='left', padx=5)
+
+        self.progress_label = ttk.Label(options_frame, text="")
+        self.progress_label.pack(side='left', padx=5)
+
+        # Stop event for cancellation
+        self.stop_import_event = threading.Event()
 
         # Results
         results_frame = ttk.LabelFrame(tab, text="Parse Results", padding=10)
@@ -369,6 +391,7 @@ class CZDSUtilsGUI:
                     self.config.CZDS_API_BASE_URL,
                     self.config.CZDS_USERNAME,
                     self.config.CZDS_PASSWORD,
+                    auth_url=self.config.CZDS_AUTH_URL,
                     timeout=self.config.REQUEST_TIMEOUT,
                     max_retries=self.config.MAX_RETRIES,
                     validate_ssl=self.config.VALIDATE_SSL
@@ -387,14 +410,15 @@ class CZDSUtilsGUI:
                 ))
 
             except CZDSError as e:
-                self.logger.error(f"Authentication failed: {e.safe_message}")
+                error_msg = e.safe_message
+                self.logger.error(f"Authentication failed: {error_msg}")
                 self.root.after(0, lambda: self.auth_status.config(
                     text="✗ Failed",
                     foreground="red"
                 ))
                 self.root.after(0, lambda: messagebox.showerror(
                     "Error",
-                    e.safe_message
+                    error_msg
                 ))
 
         threading.Thread(target=auth_thread, daemon=True).start()
@@ -417,10 +441,11 @@ class CZDSUtilsGUI:
                 ))
 
             except CZDSError as e:
-                self.logger.error(f"Failed to fetch links: {e.safe_message}")
+                error_msg = e.safe_message
+                self.logger.error(f"Failed to fetch links: {error_msg}")
                 self.root.after(0, lambda: messagebox.showerror(
                     "Error",
-                    e.safe_message
+                    error_msg
                 ))
 
         threading.Thread(target=fetch_thread, daemon=True).start()
@@ -474,12 +499,24 @@ class CZDSUtilsGUI:
                     f"Downloaded {stats['bytes_downloaded']:,} bytes"
                 ))
 
+                # Auto-load into parser
+                def auto_load():
+                    # Switch to Parser tab (index 3)
+                    self.notebook.select(3)
+                    # Set file path
+                    self.parser_file_path.set(str(filename))
+                    # Auto-detect TLD
+                    self._auto_detect_tld(str(filename))
+                    
+                self.root.after(0, auto_load)
+
             except CZDSError as e:
-                self.logger.error(f"Download failed: {e.safe_message}")
+                error_msg = e.safe_message
+                self.logger.error(f"Download failed: {error_msg}")
                 self.root.after(0, lambda: self.download_progress.stop())
                 self.root.after(0, lambda: messagebox.showerror(
                     "Error",
-                    e.safe_message
+                    error_msg
                 ))
 
         threading.Thread(target=download_thread, daemon=True).start()
@@ -503,6 +540,13 @@ class CZDSUtilsGUI:
             self.stats_text.insert(tk.END, f"Database Size: {stats['database_size_bytes']:,} bytes\n")
 
             self.stats_text.configure(state='disabled')
+
+            # Update TLD dropdown
+            tlds = self.database.get_all_tlds()
+            tld_names = [r['tld'] for r in tlds]
+            self.tld_entry['values'] = sorted(tld_names)
+            if tld_names and not self.tld_entry.get():
+                self.tld_entry.current(0)
 
         except CZDSError as e:
             messagebox.showerror("Error", e.safe_message)
@@ -548,6 +592,29 @@ class CZDSUtilsGUI:
 
         if filename:
             self.parser_file_path.set(filename)
+            self._auto_detect_tld(filename)
+
+    def _auto_detect_tld(self, filename: str):
+        """Auto-detect TLD from filename and populate field if empty."""
+        # Auto-detect TLD if field is empty
+        if not self.parser_tld.get().strip():
+            path = Path(filename)
+            name = path.name.lower()
+            
+            # Strip known extensions
+            for ext in ['.txt.gz', '.zone.gz', '.gz', '.txt', '.zone']:
+                if name.endswith(ext):
+                    name = name[:-len(ext)]
+                    break
+            
+            self.parser_tld.delete(0, tk.END)
+            self.parser_tld.insert(0, name)
+
+    def cancel_import(self):
+        """Signal import cancellation."""
+        self.stop_import_event.set()
+        self.logger.info("Cancelling import...")
+        self.cancel_button.config(state='disabled')
 
     def parse_and_import(self):
         """Parse zone file and import to database."""
@@ -565,54 +632,112 @@ class CZDSUtilsGUI:
             messagebox.showerror("Error", "Database not initialized")
             return
 
+        # Reset UI state
+        self.stop_import_event.clear()
+        self.parse_button.config(state='disabled')
+        self.cancel_button.config(state='normal')
+        self.progress_label.config(text="Starting...")
+
         def parse_thread():
+            total_imported = 0
+            lines_processed = 0
+
             try:
                 self.logger.info(f"Parsing zone file for .{tld}...")
 
                 parser = ZoneFileParser(
                     tld,
-                    validate_domains=self.validate_domains_var.get()
+                    validate_domains=self.validate_domains_var.get(),
+                    check_active=self.check_active_var.get()
                 )
+
+                # Calculate total lines
+                self.root.after(0, lambda: self.progress_label.config(text="Calculating total lines..."))
+                total_lines = parser.count_lines(Path(file_path))
+                self.logger.info(f"Total lines to process: {total_lines:,}")
+
+                # Progress callback
+                def update_progress(count):
+                    nonlocal lines_processed
+                    lines_processed = count
+                    
+                    if total_lines > 0:
+                        percent = (count / total_lines) * 100
+                        msg = f"Processed: {count:,} / {total_lines:,} ({percent:.1f}%) | Imported: {total_imported:,}"
+                    else:
+                        msg = f"Processed: {count:,} | Imported: {total_imported:,}"
+                        
+                    self.root.after(0, lambda: self.progress_label.config(text=msg))
+
+                # Check stop callback
+                def should_stop():
+                    return self.stop_import_event.is_set()
 
                 # Parse in batches
                 batch = []
                 batch_size = 1000
-                total_imported = 0
 
-                for domain in parser.parse_file(Path(file_path)):
+                # Use parser with callbacks
+                for domain in parser.parse_file(
+                    Path(file_path),
+                    progress_callback=update_progress,
+                    should_stop=should_stop
+                ):
+                    if self.stop_import_event.is_set():
+                        break
+
                     batch.append(domain)
 
                     if len(batch) >= batch_size:
                         count = self.database.add_domains_batch(tld, batch)
                         total_imported += count
                         batch = []
-
-                        self.logger.info(f"Imported {total_imported:,} domains so far...")
+                        
+                        # Force UI update for imported count
+                        update_progress(lines_processed)
 
                 # Import remaining
-                if batch:
+                if batch and not self.stop_import_event.is_set():
                     count = self.database.add_domains_batch(tld, batch)
                     total_imported += count
+                    update_progress(lines_processed)
 
-                self.logger.info(f"Import complete: {total_imported:,} domains")
-
-                # Update display
-                result_text = f"Successfully imported {total_imported:,} domains for .{tld}\n"
+                # Final cleanup
+                if self.stop_import_event.is_set():
+                    self.logger.info("Import cancelled by user")
+                    result_text = f"Import cancelled. Imported {total_imported:,} domains so far.\n"
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Cancelled",
+                        f"Import cancelled.\nImported: {total_imported:,}"
+                    ))
+                else:
+                    self.logger.info(f"Import complete: {total_imported:,} domains")
+                    result_text = f"Successfully imported {total_imported:,} domains for .{tld}\n"
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Success",
+                        f"Imported {total_imported:,} domains"
+                    ))
 
                 self.root.after(0, lambda: self._update_parser_results(result_text))
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Success",
-                    f"Imported {total_imported:,} domains"
-                ))
 
             except CZDSError as e:
-                self.logger.error(f"Parse/import failed: {e.safe_message}")
+                error_msg = e.safe_message
+                self.logger.error(f"Parse/import failed: {error_msg}")
                 self.root.after(0, lambda: messagebox.showerror(
                     "Error",
-                    e.safe_message
+                    error_msg
                 ))
+            finally:
+                # Re-enable/disable buttons
+                self.root.after(0, lambda: self._reset_buttons())
 
         threading.Thread(target=parse_thread, daemon=True).start()
+
+    def _reset_buttons(self):
+        """Reset buttons after import."""
+        self.parse_button.config(state='normal')
+        self.cancel_button.config(state='disabled')
+        self.progress_label.config(text="")
 
     def _update_parser_results(self, text):
         """Update parser results display."""

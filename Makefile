@@ -1,6 +1,7 @@
 .PHONY: help install install-dev test test-security test-coverage lint format clean build docker-build docker-run setup
 
 # Default target
+# Default target
 help:
 	@echo "Available targets:"
 	@echo "  make install        - Install production dependencies"
@@ -15,46 +16,53 @@ help:
 	@echo "  make build          - Build distribution package"
 	@echo "  make docker-build   - Build Docker image"
 	@echo "  make docker-run     - Run Docker container"
+	@echo "  make run            - Run the application (alias for gui)"
 	@echo "  make gui            - Launch GUI application"
 	@echo "  make cli-help       - Show CLI help"
+
+# Detect Python interpreter
+PYTHON := ./venv/bin/python
+ifeq ($(wildcard $(PYTHON)),)
+	PYTHON := python3
+endif
 
 # Setup virtual environment and install dependencies
 setup:
 	@echo "Setting up development environment..."
 	python3 -m venv venv
-	./venv/bin/pip install --upgrade pip
-	./venv/bin/pip install -e ".[dev]"
+	$(PYTHON) -m pip install --upgrade pip
+	$(PYTHON) -m pip install -e ".[dev]"
 	@echo "Setup complete! Activate with: source venv/bin/activate"
 
 # Install production dependencies
 install:
-	pip install -e .
+	$(PYTHON) -m pip install -e .
 
 # Install development dependencies
 install-dev:
-	pip install -e ".[dev]"
+	$(PYTHON) -m pip install -e ".[dev]"
 
 # Run all tests
 test:
-	pytest -v tests/
+	$(PYTHON) -m pytest -v tests/
 
 # Run security-focused tests
 test-security:
-	pytest -v tests/test_security.py tests/test_validators.py
+	$(PYTHON) -m pytest -v tests/test_security.py tests/test_validators.py
 
 # Run tests with coverage
 test-coverage:
-	pytest --cov=czds_utils --cov-report=html --cov-report=term tests/
+	$(PYTHON) -m pytest --cov=czds_utils --cov-report=html --cov-report=term tests/
 	@echo "Coverage report generated in htmlcov/index.html"
 
 # Run linters
 lint:
-	flake8 src/czds_utils tests/ --max-line-length=120 --exclude=venv,build,dist
-	mypy src/czds_utils --ignore-missing-imports
+	$(PYTHON) -m flake8 src/czds_utils tests/ --max-line-length=120 --exclude=venv,build,dist
+	$(PYTHON) -m mypy src/czds_utils --ignore-missing-imports
 
 # Format code
 format:
-	black src/czds_utils tests/ --line-length=120
+	$(PYTHON) -m black src/czds_utils tests/ --line-length=120
 
 # Clean build artifacts
 clean:
@@ -71,7 +79,7 @@ clean:
 
 # Build distribution
 build: clean
-	python setup.py sdist bdist_wheel
+	$(PYTHON) setup.py sdist bdist_wheel
 
 # Build Docker image
 docker-build:
@@ -90,12 +98,15 @@ docker-down:
 	docker-compose down
 
 # Launch GUI
+run: gui
+
+# Launch GUI
 gui:
-	python -m czds_utils.gui.main_window
+	$(PYTHON) -m czds_utils.gui.main_window
 
 # Show CLI help
 cli-help:
-	python -m czds_utils.cli --help
+	$(PYTHON) -m czds_utils.cli --help
 
 # Quick security check
 security-check: lint test-security

@@ -86,6 +86,12 @@ class Database:
             if conn:
                 conn.close()
 
+    @contextmanager
+    def get_connection_context(self):
+        """Public context manager for database connections (wraps _get_connection)."""
+        with self._get_connection() as conn:
+            yield conn
+
     def _init_database(self) -> None:
         """Initialize database schema.
 
@@ -291,6 +297,31 @@ class Database:
             row = cursor.fetchone()
             return row['id'] if row else None
 
+    def delete_tld(self, tld: str) -> bool:
+        """Delete all data for a specific TLD.
+
+        Args:
+            tld: TLD name (validated)
+
+        Returns:
+            True if TLD was found and deleted, False otherwise
+
+        Raises:
+            DatabaseError: If operation fails
+            ValidationError: If TLD is invalid
+        """
+        # Validate input
+        tld = Validators.validate_tld(tld, 'tld')
+
+        with self._get_connection() as conn:
+            # Parameterized DELETE
+            # Because of ON DELETE CASCADE, this will also delete all domains
+            cursor = conn.execute(
+                "DELETE FROM tlds WHERE tld = ?",
+                (tld,)
+            )
+            return cursor.rowcount > 0
+
     def add_domain(self, tld: str, domain: str) -> None:
         """Add a domain to the database.
 
@@ -322,13 +353,14 @@ class Database:
                     last_seen = excluded.last_seen
             """, (tld_id, domain, now, now))
 
-    def add_domains_batch(self, tld: str, domains: List[str], batch_size: int = 1000) -> int:
+    def add_domains_batch(self, tld: str, domains: List[str], batch_size: int = 1000, conn=None) -> int:
         """Add multiple domains in batches for efficiency.
 
         Args:
             tld: TLD name (validated)
             domains: List of domain names (validated)
             batch_size: Number of domains per transaction
+            conn: Optional existing database connection to reuse
 
         Returns:
             Number of domains added/updated
@@ -365,16 +397,42 @@ class Database:
             if not validated_batch:
                 continue
 
-            with self._get_connection() as conn:
-                # Parameterized executemany for batch insert
+            if not validated_batch:
+                continue
+            
+            # Use provided connection or create new one context
+            if conn:
+                # Use existing connection
                 conn.executemany("""
                     INSERT INTO domains (tld_id, domain, first_seen, last_seen)
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(tld_id, domain) DO UPDATE SET
                         last_seen = excluded.last_seen
                 """, [(tld_id, domain, now, now) for domain in validated_batch])
-
                 total_added += len(validated_batch)
+                # Commit if it's our responsibility? 
+                # If we passed a connection, the caller likely manages the transaction/commit scope
+                # But sqlite3 context manager commits on exit. 
+                # If `conn` is passed, we assume it's an open connection.
+                # Just executing is fine, but we should probably commit to be safe unless we are in a transaction block.
+                # However, for batch performance, we WANT to hold commit.
+                # Let's assume caller manages commit if they pass conn?
+                # Actually, `sqlite3` connection object doesn't auto-commit on execute.
+                # So we should call commit() if we want to confirm, OR rely on caller.
+                # For `sqlite3.connect` with `DEFERRED`, we need to commit.
+                conn.commit()
+            
+            else:
+                with self._get_connection() as local_conn:
+                    # Parameterized executemany for batch insert
+                    local_conn.executemany("""
+                        INSERT INTO domains (tld_id, domain, first_seen, last_seen)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(tld_id, domain) DO UPDATE SET
+                            last_seen = excluded.last_seen
+                    """, [(tld_id, domain, now, now) for domain in validated_batch])
+                    
+                    total_added += len(validated_batch)
 
         return total_added
 

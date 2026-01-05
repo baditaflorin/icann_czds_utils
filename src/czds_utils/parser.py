@@ -8,6 +8,7 @@ import gzip
 import logging
 import socket
 import concurrent.futures
+import time
 from pathlib import Path
 from typing import Iterator, Optional, Set, Callable
 from collections import Counter
@@ -31,7 +32,7 @@ class ZoneFileParser:
     # Maximum file size to process (in bytes)
     MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10 GB
 
-    def __init__(self, tld: str, validate_domains: bool = True, check_active: bool = False, concurrency: int = 50):
+    def __init__(self, tld: str, validate_domains: bool = True, check_active: bool = False, concurrency: int = 500):
         """Initialize zone file parser.
 
         Args:
@@ -148,77 +149,142 @@ class ZoneFileParser:
         invalid_count = 0
         max_invalid = 1000  # Stop if too many invalid lines
 
-        for line in stream:
-            # Check for cancellation
-            if should_stop and should_stop():
-                self._logger.info("Parsing cancelled by user")
-                return
+        if not self.check_active:
+            # Sequential processing (fast path for non-active check)
+            for line in stream:
+                if should_stop and should_stop():
+                    self._logger.info("Parsing cancelled by user")
+                    return
 
-            line_number += 1
+                line_number += 1
+                
+                # Yield to other threads periodically to prevent GUI freezes
+                if line_number % 1000 == 0:
+                    time.sleep(0)
 
-            # Report progress periodically (every 100 lines or so to avoid overhead)
-            # or just every line if checking active, since that's slow.
-            # Let's report every line for smoothing UI updates.
-            if progress_callback:
-                progress_callback(line_number)
+                if progress_callback:
+                    progress_callback(line_number)
 
-            # Security check: limit line length
-            if len(line) > self.MAX_LINE_LENGTH:
-                self._logger.warning(
-                    f"Line {line_number} exceeds maximum length, skipping"
-                )
-                invalid_count += 1
-                if invalid_count > max_invalid:
-                    raise ParseError(
-                        f"Too many invalid lines (>{max_invalid})",
-                        line_number=line_number
-                    )
-                continue
+                if len(line) > self.MAX_LINE_LENGTH:
+                    self._logger.warning(f"Line {line_number} exceeds length")
+                    invalid_count += 1
+                    if invalid_count > max_invalid:
+                        raise ParseError(f"Too many invalid lines (>{max_invalid})", line_number=line_number)
+                    continue
 
-            # Skip empty lines and comments
-            line = line.strip()
-            if not line or line.startswith(';') or line.startswith('#'):
-                continue
+                line = line.strip()
+                if not line or line.startswith(';') or line.startswith('#'):
+                    continue
 
-            try:
-                # Extract domain from line
-                domain = self._extract_domain(line)
+                try:
+                    domain = self._extract_domain(line)
+                    if domain:
+                        if self.validate_domains:
+                            try:
+                                domain = Validators.validate_domain(domain, 'domain')
+                            except ValidationError:
+                                invalid_count += 1
+                                if invalid_count > max_invalid:
+                                    raise ParseError(f"Too many invalid domains (>{max_invalid})", line_number=line_number)
+                                continue
+                        
+                        # Active check (DNS resolution)
+                        if self.check_active: # This check is redundant here due to the outer if/else
+                            if not self._is_active(domain):
+                                # Skip inactive domains silently (or log debug)
+                                self._logger.debug(f"Domain {domain} is inactive (NXDOMAIN)")
+                                continue
 
-                if domain:
-                    # Validate domain if enabled
-                    if self.validate_domains:
-                        try:
-                            domain = Validators.validate_domain(domain, 'domain')
-                        except ValidationError:
-                            invalid_count += 1
-                            if invalid_count > max_invalid:
-                                raise ParseError(
-                                    f"Too many invalid domains (>{max_invalid})",
-                                    line_number=line_number
+                        yield domain
+                except Exception as e:
+                    self._logger.debug(f"Error parsing line {line_number}: {str(e)}")
+                    invalid_count += 1
+                    if invalid_count > max_invalid:
+                        raise ParseError(f"Too many parse errors (>{max_invalid})", line_number=line_number)
+
+        else:
+            # Parallel processing for active checks
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                futures = {}
+                
+                for line in stream:
+                    if should_stop and should_stop():
+                        self._logger.info("Parsing cancelled by user")
+                        # Cancel pending futures
+                        for f in futures:
+                            f.cancel()
+                        return
+
+                    line_number += 1
+                    
+                    # We only update progress when we yield or skip, but for threaded we need to be careful.
+                    # Simple approach: update when we submit? No, better when we retire.
+                    # But we want to indicate "Processed" lines.
+                    # Let's count "Processed" as lines read from file.
+                    if progress_callback:
+                        progress_callback(line_number)
+
+                    if len(line) > self.MAX_LINE_LENGTH:
+                        invalid_count += 1
+                        continue
+
+                    line = line.strip()
+                    if not line or line.startswith(';') or line.startswith('#'):
+                        continue
+
+                    try:
+                        domain = self._extract_domain(line)
+                        if domain:
+                            if self.validate_domains:
+                                try:
+                                    domain = Validators.validate_domain(domain, 'domain')
+                                except ValidationError:
+                                    invalid_count += 1
+                                    continue
+                            
+                            # Submit active check
+                            future = executor.submit(self._is_active, domain)
+                            futures[future] = domain
+
+                            # Yield completed results to keep memory low
+                            # We check if we have too many pending futures or if any are done
+                            # But wait, we want to yield order? No order doesn't matter much for set storage.
+                            # To manage memory, let's process completed ones periodically or cap limits?
+                            # Using 'futures' dict can grow large.
+                            # Standard pattern: cap pending tasks.
+                            
+                            if len(futures) >= self.concurrency * 2:
+                                # Wait for some to finish
+                                done, _ = concurrent.futures.wait(
+                                    futures, 
+                                    return_when=concurrent.futures.FIRST_COMPLETED
                                 )
-                            continue
+                                for f in done:
+                                    d = futures.pop(f)
+                                    try:
+                                        if f.result():
+                                            yield d
+                                    except Exception:
+                                        pass # Ignore thread errors
 
-                            continue
+                    except Exception:
+                        invalid_count += 1
+                        if invalid_count > max_invalid:
+                            # Cleanup
+                            for f in futures:
+                                f.cancel()
+                            raise ParseError(f"Too many parse errors (>{max_invalid})", line_number=line_number)
 
-                    # Active check (DNS resolution)
-                    if self.check_active:
-                        if not self._is_active(domain):
-                            # Skip inactive domains silently (or log debug)
-                            self._logger.debug(f"Domain {domain} is inactive (NXDOMAIN)")
-                            continue
-
-                    yield domain
-
-            except Exception as e:
-                self._logger.debug(
-                    f"Error parsing line {line_number}: {str(e)}"
-                )
-                invalid_count += 1
-                if invalid_count > max_invalid:
-                    raise ParseError(
-                        f"Too many parse errors (>{max_invalid})",
-                        line_number=line_number
-                    )
+                # Process remaining futures
+                for f in concurrent.futures.as_completed(futures):
+                    if should_stop and should_stop():
+                        break
+                    d = futures[f]
+                    try:
+                        if f.result():
+                            yield d
+                    except Exception:
+                        pass
 
     def _is_active(self, domain: str) -> bool:
         """Check if domain resolves to an IP active address.

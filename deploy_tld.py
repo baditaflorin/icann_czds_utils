@@ -329,7 +329,7 @@ def collect_domains(tld, args, shared_seen=None):
             apex_domains.append(a)
     print(f"    {len(apex_domains):,} unique apex domains")
 
-    if not args.dns_filter:
+    if args.skip_dns_filter:
         print(f"  DNS filter skipped")
         return apex_domains
 
@@ -400,7 +400,7 @@ def parse_args():
                    help="Merge all TLDs into one deduplicated container instead of one per TLD")
     p.add_argument("--name", help="Override container name (used as go-domainscope-{name}-icann-domains)")
     p.add_argument("--db", default=str(DEFAULT_DB), help=f"SQLite DB path (default: {DEFAULT_DB})")
-    p.add_argument("--dns-filter", action="store_true", help="Filter to DNS-resolving domains only (slow)")
+    p.add_argument("--skip-dns-filter", action="store_true", help="Skip DNS resolution check (not recommended)")
     p.add_argument("--workers", type=int, default=300, help="DNS check workers (default: 300)")
     p.add_argument("--timeout", type=float, default=3.0, help="DNS timeout seconds (default: 3)")
     p.add_argument("--dry-run", action="store_true", help="Export and filter locally, skip upload")

@@ -24,21 +24,15 @@ from czds_utils.errors import CZDSError
 
 
 class TextHandler(logging.Handler):
-    """Logging handler that writes to a tkinter Text widget."""
+    """Logging handler that writes to a queue for thread-safe GUI updates."""
 
-    def __init__(self, text_widget):
+    def __init__(self, queue):
         super().__init__()
-        self.text_widget = text_widget
+        self.queue = queue
 
     def emit(self, record):
         msg = self.format(record)
-        def append():
-            self.text_widget.configure(state='normal')
-            self.text_widget.insert(tk.END, msg + '\n')
-            self.text_widget.configure(state='disabled')
-            self.text_widget.see(tk.END)
-
-        self.text_widget.after(0, append)
+        self.queue.put({'type': 'log', 'msg': msg})
 
 
 class CZDSUtilsGUI:
@@ -52,6 +46,10 @@ class CZDSUtilsGUI:
         """
         self.root = root
         self.root.title("ICANN CZDS Utils - Secure Management Tool")
+
+        # Concurrency Queues
+        self.task_queue = queue.Queue()
+        self.result_queue = queue.Queue()
 
         # Configuration
         self.config: Optional[Config] = None
@@ -82,10 +80,7 @@ class CZDSUtilsGUI:
         height = self.config.WINDOW_HEIGHT if self.config else 700
         self.root.geometry(f"{width}x{height}")
 
-        # Concurrency Queues
-        self.task_queue = queue.Queue()
-        self.result_queue = queue.Queue()
-        
+
         # Start background worker
         self.is_running = True
         threading.Thread(target=self._worker_loop, daemon=True).start()
@@ -108,8 +103,13 @@ class CZDSUtilsGUI:
                 msg_type = msg.get('type')
                 
                 if msg_type == 'log':
-                    # Log message handled by handler usually, but here for status
-                    pass 
+                    # Log message handled via queue to prevent flooding
+                    text = msg.get('msg', '')
+                    if text:
+                        self.log_text.configure(state='normal')
+                        self.log_text.insert(tk.END, text + '\n')
+                        self.log_text.configure(state='disabled')
+                        self.log_text.see(tk.END) 
                 elif msg_type == 'status':
                     # Update status label
                     self._update_download_status(msg.get('log_msg', ''), msg.get('status_text', ''))
@@ -197,13 +197,30 @@ class CZDSUtilsGUI:
                 })
                 self.result_queue.put({'type': 'tree_update', 'item_id': item_id, 'status': "Importing..."})
                 
+                # Progress callback for batch import
+                last_update_time = 0
+                def batch_progress(stage, count, total, imported):
+                    nonlocal last_update_time
+                    current_time = time.time()
+                    
+                    # Update status in tree occasionally (max 2 times per second)
+                    if current_time - last_update_time >= 0.5:
+                        last_update_time = current_time
+                        status_msg = f"Imported: {imported:,}"
+                        self.result_queue.put({
+                            'type': 'tree_update', 
+                            'item_id': item_id, 
+                            'status': status_msg
+                        })
+
                 total = self._import_zone_file(
                     tld, 
                     str(cache_path),
                     validate_domains=config['validate'],
                     check_active=config['active'],
-                    progress_callback=None, # We can implement detailed progress later if needed
-                    should_stop=None
+                    progress_callback=batch_progress,
+                    should_stop=None,
+                    skip_line_count=True # Optimize for speed
                 )
                 
                 self.result_queue.put({'type': 'tree_update', 'item_id': item_id, 'status': f"{total:,} domains"})
@@ -523,7 +540,7 @@ class CZDSUtilsGUI:
         self.log_text.pack(fill='both', expand=True, padx=10, pady=10)
 
         # Add log handler
-        text_handler = TextHandler(self.log_text)
+        text_handler = TextHandler(self.result_queue)
         text_handler.setFormatter(
             logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         )
@@ -927,7 +944,7 @@ class CZDSUtilsGUI:
         self.logger.info("Cancelling import...")
         self.cancel_button.config(state='disabled')
 
-    def _import_zone_file(self, tld, file_path, validate_domains=True, check_active=False, progress_callback=None, should_stop=None):
+    def _import_zone_file(self, tld, file_path, validate_domains=True, check_active=False, progress_callback=None, should_stop=None, skip_line_count=False):
         """Reusable method to import a zone file."""
         total_imported = 0
         lines_processed = 0
@@ -941,12 +958,16 @@ class CZDSUtilsGUI:
                 check_active=check_active
             )
 
-            # Calculate total lines
-            if progress_callback:
-                progress_callback("Calculating lines...", 0)
-            
-            total_lines = parser.count_lines(Path(file_path))
-            self.logger.info(f"Total lines to process: {total_lines:,}")
+            total_lines = 0
+            if not skip_line_count:
+                # Calculate total lines
+                if progress_callback:
+                    progress_callback("Calculating lines...", 0)
+                
+                total_lines = parser.count_lines(Path(file_path))
+                self.logger.info(f"Total lines to process: {total_lines:,}")
+            else:
+                self.logger.info("Skipping line count calculation for performance")
 
             # Local progress wrapper
             def update_progress(count):

@@ -285,38 +285,40 @@ class CZDSClient:
                     stream=True
                 )
 
-            if response.status_code != 200:
-                raise APIError(
-                    f"Download failed: HTTP {response.status_code}",
-                    status_code=response.status_code
-                )
+            # Ensure we close the response to release the connection back to the pool
+            with response:
+                if response.status_code != 200:
+                    raise APIError(
+                        f"Download failed: HTTP {response.status_code}",
+                        status_code=response.status_code
+                    )
 
-            # Get file size if available
-            total_size = int(response.headers.get('content-length', 0))
+                # Get file size if available
+                total_size = int(response.headers.get('content-length', 0))
 
-            # Download file in chunks
-            bytes_downloaded = 0
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-                        bytes_downloaded += len(chunk)
+                # Download file in chunks
+                bytes_downloaded = 0
+                with open(output_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            bytes_downloaded += len(chunk)
 
-                        # Call progress callback if provided
-                        if progress_callback and total_size:
-                            progress = (bytes_downloaded / total_size) * 100
-                            progress_callback(bytes_downloaded, total_size, progress)
+                            # Call progress callback if provided
+                            if progress_callback and total_size:
+                                progress = (bytes_downloaded / total_size) * 100
+                                progress_callback(bytes_downloaded, total_size, progress)
 
-            download_time = time.time() - start_time
+                download_time = time.time() - start_time
 
-            stats = {
-                'file_path': str(output_path),
-                'bytes_downloaded': bytes_downloaded,
-                'download_time_seconds': download_time,
-                'download_speed_mbps': (bytes_downloaded / 1024 / 1024) / download_time if download_time > 0 else 0
-            }
-
-            self._logger.info(
+                stats = {
+                    'file_path': str(output_path),
+                    'bytes_downloaded': bytes_downloaded,
+                    'download_time_seconds': download_time,
+                    'download_speed_mbps': (bytes_downloaded / 1024 / 1024) / download_time if download_time > 0 else 0
+                }
+                
+                self._logger.info(
                 f"Download complete: {bytes_downloaded} bytes in {download_time:.2f}s "
                 f"({stats['download_speed_mbps']:.2f} MB/s)"
             )

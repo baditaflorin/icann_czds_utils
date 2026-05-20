@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """End-to-end pipeline: DB export → DNS filter → deploy to domainscope server.
 
-For each TLD:
+For each TLD (or merged batch):
   1. Export apex domains from the local CZDS SQLite database
   2. DNS-filter to active-only domains
-  3. Create /opt/go-domainscope-{tld}-icann-domains/ on the server
+  3. Create /opt/go-domainscope-{name}-icann-domains/ on the server
   4. Upload Dockerfile, docker-compose.yml, main.go, domains.txt
   5. Build and start the Docker container
 
 Usage:
     python deploy_tld.py net
-    python deploy_tld.py net info xyz app dev
-    python deploy_tld.py net --no-dns-filter          # skip DNS check
-    python deploy_tld.py net --dry-run                # local only, no upload
+    python deploy_tld.py net info xyz app dev          # one container per TLD
+    python deploy_tld.py net info xyz --merge          # one combined container
+    python deploy_tld.py net --no-dns-filter           # skip DNS check
+    python deploy_tld.py net --dry-run                 # local only, no upload
     python deploy_tld.py net --workers 400 --timeout 2
 """
 
@@ -298,79 +299,66 @@ def export_from_db(db_path, tld):
 
 # ── main pipeline ─────────────────────────────────────────────────────────────
 
-def process_tld(tld, args):
-    print(f"\n{'='*60}")
-    print(f"  TLD: .{tld}")
-    print(f"{'='*60}")
+def collect_domains(tld, args, shared_seen=None):
+    """Export, strip subdomains, and optionally DNS-filter one TLD.
 
+    shared_seen: if provided (a set), domains already in it are skipped —
+                 used by --merge to deduplicate across TLDs.
+    Returns list of final domains, or None on error.
+    """
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"  ERROR: DB not found at {db_path}")
-        return False
+        return None
 
-    # 1. Export from DB
-    print(f"  [1/4] Exporting .{tld} from database...")
+    print(f"  Exporting .{tld} from database...")
     t0 = time.time()
-    raw_domains = export_from_db(db_path, tld)
-    if not raw_domains:
+    raw = export_from_db(db_path, tld)
+    if not raw:
         print(f"  ERROR: no domains found for .{tld} in DB")
-        return False
-    print(f"        {len(raw_domains):,} domains exported ({time.time()-t0:.1f}s)")
+        return None
+    print(f"    {len(raw):,} raw rows ({time.time()-t0:.1f}s)")
 
-    # 2. Strip subdomains
-    print(f"  [2/4] Stripping subdomains...")
-    seen = set()
+    print(f"  Stripping subdomains...")
+    seen = shared_seen if shared_seen is not None else set()
     apex_domains = []
-    for d in raw_domains:
+    for d in raw:
         a = apex(d)
         if a and a not in seen:
             seen.add(a)
             apex_domains.append(a)
-    print(f"        {len(apex_domains):,} unique apex domains")
+    print(f"    {len(apex_domains):,} unique apex domains")
 
-    # 3. DNS filter
     if args.no_dns_filter:
-        final_domains = apex_domains
-        print(f"  [3/4] DNS filter skipped")
-    else:
-        print(f"  [3/4] DNS filtering ({args.workers} workers, {args.timeout}s timeout)...")
-        t0 = time.time()
-        final_domains = list(dns_filter(apex_domains, args.workers, args.timeout))
-        elapsed = time.time() - t0
-        pct = len(final_domains) / len(apex_domains) * 100 if apex_domains else 0
-        print(f"        {len(final_domains):,} active ({pct:.1f}%) in {elapsed:.0f}s")
+        print(f"  DNS filter skipped")
+        return apex_domains
 
-    if not final_domains:
-        print(f"  ERROR: no active domains found for .{tld}")
-        return False
+    print(f"  DNS filtering ({args.workers} workers, {args.timeout}s timeout)...")
+    t0 = time.time()
+    final = list(dns_filter(apex_domains, args.workers, args.timeout))
+    elapsed = time.time() - t0
+    pct = len(final) / len(apex_domains) * 100 if apex_domains else 0
+    print(f"    {len(final):,} active ({pct:.1f}%) in {elapsed:.0f}s")
+    return final
 
-    # 4. Write temp file
+
+def deploy(name, final_domains, args):
+    """Write files locally and deploy a single container for the given domain list."""
     tmpdir = tempfile.mkdtemp()
+
     domains_file = os.path.join(tmpdir, "domains.txt")
     with open(domains_file, "w") as f:
         for d in final_domains:
             f.write(d + "\n")
 
     if args.dry_run:
-        print(f"\n  DRY RUN — files written to {tmpdir}")
-        print(f"  Would deploy {len(final_domains):,} domains to server")
+        print(f"\n  DRY RUN — {len(final_domains):,} domains written to {tmpdir}")
         return True
 
-    # 5. Deploy to server
-    remote_dir = f"{REMOTE_BASE}/go-domainscope-{tld}-icann-domains"
-    print(f"  [4/4] Deploying to {remote_dir}...")
+    remote_dir = f"{REMOTE_BASE}/go-domainscope-{name}-icann-domains"
+    print(f"  Deploying to {remote_dir}...")
 
     ssh(f"sudo mkdir -p {remote_dir} && sudo chown {TARGET_USER}:{TARGET_USER} {remote_dir}")
-
-    # Write local temp files for Dockerfile / main.go / compose
-    dockerfile_path = os.path.join(tmpdir, "Dockerfile")
-    maingo_path     = os.path.join(tmpdir, "main.go")
-    compose_path    = os.path.join(tmpdir, "docker-compose.yml")
-
-    with open(dockerfile_path, "w") as f:
-        f.write(DOCKERFILE)
-    with open(maingo_path, "w") as f:
-        f.write(MAIN_GO)
 
     compose = f"""\
 services:
@@ -386,28 +374,30 @@ services:
     volumes:
       - ./domains.txt:/app/domains.txt
 """
-    with open(compose_path, "w") as f:
-        f.write(compose)
+    for fname, content in [("Dockerfile", DOCKERFILE), ("main.go", MAIN_GO), ("docker-compose.yml", compose)]:
+        path = os.path.join(tmpdir, fname)
+        with open(path, "w") as f:
+            f.write(content)
 
     for fname in ["Dockerfile", "main.go", "docker-compose.yml", "domains.txt"]:
-        local = os.path.join(tmpdir, fname)
-        print(f"        uploading {fname}...")
-        scp(local, f"{remote_dir}/{fname}")
+        print(f"    uploading {fname}...")
+        scp(os.path.join(tmpdir, fname), f"{remote_dir}/{fname}")
 
     shutil.rmtree(tmpdir)
 
-    # Build and start
-    print(f"        building and starting container...")
+    print(f"    building and starting container...")
     ssh(f"cd {remote_dir} && docker compose down 2>/dev/null || true && docker compose build && docker compose up -d")
 
-    print(f"\n  Done: {len(final_domains):,} domains deployed for .{tld}")
+    print(f"\n  Done: {len(final_domains):,} domains live at {remote_dir}")
     print(f"  Logs: ssh -J {JUMP_HOST} {TARGET_USER}@{TARGET_HOST} \"cd {remote_dir} && docker compose logs -f domain-processor\"")
     return True
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Deploy one or more TLDs to the domainscope processing server.")
-    p.add_argument("tlds", nargs="+", metavar="TLD", help="One or more TLDs to process (e.g. net info xyz)")
+    p.add_argument("tlds", nargs="+", metavar="TLD", help="One or more TLDs (e.g. net info xyz)")
+    p.add_argument("--merge", action="store_true",
+                   help="Merge all TLDs into one deduplicated container instead of one per TLD")
     p.add_argument("--db", default=str(DEFAULT_DB), help=f"SQLite DB path (default: {DEFAULT_DB})")
     p.add_argument("--no-dns-filter", action="store_true", help="Skip DNS resolution check")
     p.add_argument("--workers", type=int, default=300, help="DNS check workers (default: 300)")
@@ -418,6 +408,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    tlds = [t.lower().strip(".") for t in args.tlds]
 
     if not args.dry_run:
         missing = [v for v, k in [("DEPLOY_JUMP_HOST", JUMP_HOST), ("DEPLOY_HOST", TARGET_HOST)] if not k]
@@ -429,18 +420,52 @@ def main():
             print("  export DEPLOY_REMOTE_BASE=/opt # default: /opt")
             sys.exit(1)
 
-    results = {}
-    for tld in args.tlds:
-        tld = tld.lower().strip(".")
-        ok = process_tld(tld, args)
-        results[tld] = ok
+    if args.merge:
+        # ── merged mode: one container, all TLDs deduplicated ──────────────
+        name = "-".join(tlds)
+        print(f"\n{'='*60}")
+        print(f"  MERGED: {', '.join(f'.{t}' for t in tlds)}")
+        print(f"  Container name: go-domainscope-{name}-icann-domains")
+        print(f"{'='*60}\n")
 
-    print(f"\n{'='*60}")
-    print("  Summary")
-    print(f"{'='*60}")
-    for tld, ok in results.items():
-        status = "OK" if ok else "FAILED"
-        print(f"  .{tld:<15} {status}")
+        shared_seen = set()
+        all_domains = []
+        for tld in tlds:
+            print(f"\n--- .{tld} ---")
+            domains = collect_domains(tld, args, shared_seen=shared_seen)
+            if domains:
+                all_domains.extend(domains)
+                print(f"    running total: {len(all_domains):,}")
+
+        if not all_domains:
+            print("ERROR: no domains collected")
+            sys.exit(1)
+
+        print(f"\n  Total merged: {len(all_domains):,} unique domains")
+        ok = deploy(name, all_domains, args)
+        print(f"\n{'='*60}")
+        print(f"  {'OK' if ok else 'FAILED'}: {name}")
+        print(f"{'='*60}")
+
+    else:
+        # ── default: one container per TLD ──────────────────────────────────
+        results = {}
+        for tld in tlds:
+            print(f"\n{'='*60}")
+            print(f"  TLD: .{tld}")
+            print(f"{'='*60}\n")
+            domains = collect_domains(tld, args)
+            if domains:
+                ok = deploy(tld, domains, args)
+            else:
+                ok = False
+            results[tld] = ok
+
+        print(f"\n{'='*60}")
+        print("  Summary")
+        print(f"{'='*60}")
+        for tld, ok in results.items():
+            print(f"  .{tld:<15} {'OK' if ok else 'FAILED'}")
 
 
 if __name__ == "__main__":

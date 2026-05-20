@@ -329,7 +329,7 @@ def collect_domains(tld, args, shared_seen=None):
             apex_domains.append(a)
     print(f"    {len(apex_domains):,} unique apex domains")
 
-    if args.no_dns_filter:
+    if not args.dns_filter:
         print(f"  DNS filter skipped")
         return apex_domains
 
@@ -398,8 +398,9 @@ def parse_args():
     p.add_argument("tlds", nargs="+", metavar="TLD", help="One or more TLDs (e.g. net info xyz)")
     p.add_argument("--merge", action="store_true",
                    help="Merge all TLDs into one deduplicated container instead of one per TLD")
+    p.add_argument("--name", help="Override container name (used as go-domainscope-{name}-icann-domains)")
     p.add_argument("--db", default=str(DEFAULT_DB), help=f"SQLite DB path (default: {DEFAULT_DB})")
-    p.add_argument("--no-dns-filter", action="store_true", help="Skip DNS resolution check")
+    p.add_argument("--dns-filter", action="store_true", help="Filter to DNS-resolving domains only (slow)")
     p.add_argument("--workers", type=int, default=300, help="DNS check workers (default: 300)")
     p.add_argument("--timeout", type=float, default=3.0, help="DNS timeout seconds (default: 3)")
     p.add_argument("--dry-run", action="store_true", help="Export and filter locally, skip upload")
@@ -422,7 +423,11 @@ def main():
 
     if args.merge:
         # ── merged mode: one container, all TLDs deduplicated ──────────────
-        name = "-".join(tlds)
+        name = args.name if args.name else "-".join(tlds)
+        if not args.name and len(name) > 50:
+            print(f"WARNING: auto-generated name is {len(name)} chars long.")
+            print(f"  Use --name <short-name> to avoid naming issues.")
+            print(f"  Auto name: {name}\n")
         print(f"\n{'='*60}")
         print(f"  MERGED: {', '.join(f'.{t}' for t in tlds)}")
         print(f"  Container name: go-domainscope-{name}-icann-domains")
@@ -449,14 +454,17 @@ def main():
 
     else:
         # ── default: one container per TLD ──────────────────────────────────
+        if args.name and len(tlds) > 1:
+            print("WARNING: --name is ignored when deploying multiple TLDs without --merge")
         results = {}
         for tld in tlds:
+            name = args.name if (args.name and len(tlds) == 1) else tld
             print(f"\n{'='*60}")
-            print(f"  TLD: .{tld}")
+            print(f"  TLD: .{tld}  →  go-domainscope-{name}-icann-domains")
             print(f"{'='*60}\n")
             domains = collect_domains(tld, args)
             if domains:
-                ok = deploy(tld, domains, args)
+                ok = deploy(name, domains, args)
             else:
                 ok = False
             results[tld] = ok

@@ -30,6 +30,15 @@ import time
 import sqlite3
 from pathlib import Path
 
+# Auto-load .env from the project root (safe: .env is gitignored)
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 try:
     import tldextract
     _HAS_TLDEXTRACT = True
@@ -367,12 +376,17 @@ services:
     environment:
       - START_ID=1
       - END_ID={len(final_domains)}
-      - CONCURRENCY={CONCURRENCY}
-      - DELAY_MS={DELAY_MS}
+      - CONCURRENCY={args.concurrency}
+      - DELAY_MS={args.delay}
       - MAX_RETRIES={MAX_RETRIES}
       - DOMAIN_FILE=/app/domains.txt
     volumes:
       - ./domains.txt:/app/domains.txt
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 """
     for fname, content in [("Dockerfile", DOCKERFILE), ("main.go", MAIN_GO), ("docker-compose.yml", compose)]:
         path = os.path.join(tmpdir, fname)
@@ -395,7 +409,9 @@ services:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Deploy one or more TLDs to the domainscope processing server.")
-    p.add_argument("tlds", nargs="+", metavar="TLD", help="One or more TLDs (e.g. net info xyz)")
+    p.add_argument("tlds", nargs="*", metavar="TLD", help="One or more TLDs (e.g. net info xyz)")
+    p.add_argument("--from-file", metavar="FILE",
+                   help="Use a pre-filtered domain list file instead of exporting from DB (requires --name)")
     p.add_argument("--merge", action="store_true",
                    help="Merge all TLDs into one deduplicated container instead of one per TLD")
     p.add_argument("--name", help="Override container name (used as go-domainscope-{name}-icann-domains)")
@@ -404,12 +420,49 @@ def parse_args():
     p.add_argument("--workers", type=int, default=300, help="DNS check workers (default: 300)")
     p.add_argument("--timeout", type=float, default=3.0, help="DNS timeout seconds (default: 3)")
     p.add_argument("--dry-run", action="store_true", help="Export and filter locally, skip upload")
+    p.add_argument("--concurrency", type=int, default=CONCURRENCY,
+                   help=f"CONCURRENCY env var for the container (default: {CONCURRENCY})")
+    p.add_argument("--delay", type=int, default=DELAY_MS,
+                   help=f"DELAY_MS env var for the container in ms (default: {DELAY_MS})")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # ── --from-file mode: skip DB export entirely ────────────────────────────
+    if args.from_file:
+        if not args.name:
+            print("Error: --from-file requires --name <container-name>")
+            sys.exit(1)
+        src = Path(args.from_file)
+        if not src.exists():
+            print(f"Error: file not found: {src}")
+            sys.exit(1)
+        with open(src) as f:
+            domains = [line.strip() for line in f if line.strip()]
+        if not domains:
+            print(f"Error: no domains found in {src}")
+            sys.exit(1)
+        print(f"\n{'='*60}")
+        print(f"  FROM FILE: {src}  ({len(domains):,} domains)")
+        print(f"  Container: go-domainscope-{args.name}-icann-domains")
+        print(f"{'='*60}\n")
+        if not args.dry_run:
+            missing = [v for v, k in [("DEPLOY_JUMP_HOST", JUMP_HOST), ("DEPLOY_HOST", TARGET_HOST)] if not k]
+            if missing:
+                print(f"Error: set env vars: {', '.join(missing)}")
+                sys.exit(1)
+        ok = deploy(args.name, domains, args)
+        print(f"\n{'='*60}")
+        print(f"  {'OK' if ok else 'FAILED'}: {args.name}")
+        print(f"{'='*60}")
+        return
+
     tlds = [t.lower().strip(".") for t in args.tlds]
+    if not tlds:
+        print("Error: specify one or more TLDs, or use --from-file FILE --name NAME")
+        sys.exit(1)
 
     if not args.dry_run:
         missing = [v for v, k in [("DEPLOY_JUMP_HOST", JUMP_HOST), ("DEPLOY_HOST", TARGET_HOST)] if not k]

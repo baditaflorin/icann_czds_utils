@@ -22,7 +22,8 @@ class Validators:
         r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*'
         r'[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$'
     )
-    TLD_PATTERN = re.compile(r'^[a-z]{2,}$')
+    # Matches standard TLDs (letters only) and punycode IDN TLDs (xn-- prefix with alphanumeric/hyphens)
+    TLD_PATTERN = re.compile(r'^(?:xn--[a-z0-9][a-z0-9\-]{0,58}[a-z0-9]|xn--[a-z0-9]|[a-z]{2,63})$')
 
     # Dangerous patterns to block
     SQL_INJECTION_PATTERNS = [

@@ -136,3 +136,32 @@ def test_duplicate_tld_prefers_gz_and_counts_once(tmp_path, capsys):
     rows, errors = mac.run_batch(zdir, out, 10, skip=[], only=[], dry_run=False)
     assert rows == [("tech", 2, 1)] and not errors
     assert "using tech.txt.gz" in capsys.readouterr().err
+
+
+def test_failed_tld_leaves_no_partial_output(tmp_path):
+    import io
+    zdir = tmp_path / "zones"
+    zdir.mkdir()
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as g:
+        g.write(_zone("trunc", [f"name{i}" for i in range(500)]).encode())
+    (zdir / "trunc.txt.gz").write_bytes(buf.getvalue()[:-30])      # chop the trailer
+    with gzip.open(zdir / "ok.txt.gz", "wt") as f:
+        f.write(_zone("ok", ["fine"]))
+    # a different TLD whose name shares the prefix must survive the cleanup
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "trunc-extra-01.txt").write_text("keep.trunc-extra\n")
+
+    rows, errors = mac.run_batch(zdir, out, 100, skip=[], only=[], dry_run=False)
+
+    assert [r[0] for r in rows] == ["ok"]
+    assert [e[0] for e in errors] == ["trunc"] and "removed" in errors[0][1]
+    assert not (out / "trunc-01.txt").exists()
+    assert (out / "trunc-extra-01.txt").exists() and (out / "ok-01.txt").exists()
+
+
+def test_out_of_order_warning_names_the_tld(capsys):
+    mac.split_zone(["b.net.\t1\tin\tns\tx.", "a.net.\t1\tin\tns\tx."], "net",
+                   [], 10, None, dry_run=True, single_series=True)
+    assert "WARNING: net: 1 out-of-order" in capsys.readouterr().err

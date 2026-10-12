@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import gzip
+import re
 import string
 import sys
 import time
@@ -119,7 +120,7 @@ def split_zone(lines, tld, letters, chunk_size, out_dir, dry_run=False, single_s
     # A rollover opens the next file lazily, so no empty trailing files exist.
     if out_of_order:
         print(
-            f"WARNING: {out_of_order:,} out-of-order names; duplicates may remain. "
+            f"WARNING: {tld}: {out_of_order:,} out-of-order names; duplicates may remain. "
             "Re-run on `sort -u` output.",
             file=sys.stderr,
         )
@@ -158,6 +159,18 @@ def zone_files_in(zone_dir: Path, skip, only):
     return sorted(chosen.items())
 
 
+def drop_partial_output(out_dir: Path, tld: str) -> int:
+    """Delete <tld>-<NN>.txt left behind by a zone file that failed mid-read, so an
+    incomplete slice set is never mistaken for a complete one."""
+    pat = re.compile(rf"^{re.escape(tld)}-\d+\.txt$")
+    n = 0
+    for f in out_dir.iterdir():
+        if pat.match(f.name):
+            f.unlink()
+            n += 1
+    return n
+
+
 def run_batch(zone_dir, out_dir, chunk_size, skip, only, dry_run):
     """Slice every zone file in zone_dir as a single series. Returns (rows, errors)."""
     rows, errors = [], []
@@ -166,7 +179,9 @@ def run_batch(zone_dir, out_dir, chunk_size, skip, only, dry_run):
             with open_text(f) as fh:
                 counts = split_zone(fh, tld, [SINGLE], chunk_size, out_dir, dry_run, True)
         except (OSError, EOFError, ValueError) as e:  # BadGzipFile is an OSError
-            errors.append((tld, f"{type(e).__name__}: {e}"))
+            removed = 0 if dry_run else drop_partial_output(out_dir, tld)
+            errors.append((tld, f"{type(e).__name__}: {e} "
+                                f"(removed {removed} partial output files)"))
             continue
         n = counts[SINGLE]
         rows.append((tld, n, n_chunks(n, chunk_size)))

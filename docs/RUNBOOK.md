@@ -28,6 +28,16 @@ python make_all_chunks.py --zone-file zone_files/com.txt.gz --output-dir com_spl
 - Relies on the zone being sorted by name (CZDS zones are) to drop duplicates
   with O(1) memory; it warns if it sees out-of-order names (then run the zone
   through `sort -u` first).
+- Everything that is not `.com`: slice the whole folder in one go, one single
+  series per TLD (`<tld>-<NN>.txt`), skipping `com`:
+
+  ```bash
+  python make_all_chunks.py --zone-dir zone_files --skip com --output-dir other_splits
+  ```
+
+  An unreadable file is reported and skipped (non-zero exit), a TLD with no
+  second-level names produces no files, and if a TLD exists as both `.txt.gz`
+  and `.txt` the `.gz` is used with a warning.
 - Rough size for the whole `.com` zone: about 17.7 bytes/domain, so ~2.8 GB of
   text across ~320 files if `.com` has ~160M names (an assumption; `--dry-run`
   gives the real count). `make_next_chunks.py` is the older continue-after-

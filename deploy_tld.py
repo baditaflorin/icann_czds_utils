@@ -52,8 +52,15 @@ TARGET_HOST = os.environ.get("DEPLOY_HOST", "")
 REMOTE_BASE = os.environ.get("DEPLOY_REMOTE_BASE", "/opt")
 
 DEFAULT_DB  = Path(__file__).parent / "data" / "czds.db"
-CONCURRENCY = 13
-DELAY_MS    = 2000
+# Safe defaults, matching production (2026-10). Each worker paces itself at
+# one request per DELAY_MS, so request rate per container is
+# CONCURRENCY * 1000 / DELAY_MS. The upstream search path is the shared
+# bottleneck, so keep totals across all containers small; raise deliberately.
+CONCURRENCY = 1
+DELAY_MS    = 1000
+# Optional: pin the API hostname to an internal gateway IP. Leave unset on a
+# server that resolves it publicly.
+API_HOST_IP = os.environ.get("DOMAINSCOPE_API_IP", "")
 MAX_RETRIES = 0
 
 # ── Dockerfile / main.go templates ───────────────────────────────────────────
@@ -150,13 +157,13 @@ func main() {
 \tsemaphore := make(chan struct{}, concurrency)
 \tjobs := make(chan DomainJob, concurrency*2)
 \tvar wg sync.WaitGroup
-\tclient := &http.Client{Timeout: 30 * time.Second}
-\trateLimiter := time.NewTicker(time.Duration(delayMs) * time.Millisecond)
-\tdefer rateLimiter.Stop()
-
+\tclient := &http.Client{Timeout: 45 * time.Second}
 \tfor i := 0; i < concurrency; i++ {
 \t\twg.Add(1)
-\t\tgo worker(client, jobs, semaphore, rateLimiter, maxRetries, &wg)
+\t\t// Each worker gets its own ticker so DELAY_MS paces every worker
+\t\t// independently instead of throttling the whole container to one
+\t\t// request per DELAY_MS regardless of CONCURRENCY.
+\t\tgo worker(client, jobs, semaphore, delayMs, maxRetries, &wg)
 \t}
 
 \tscanner := bufio.NewScanner(f)
@@ -185,8 +192,10 @@ func main() {
 \tlog.Printf("Completed %d domains (lines %d to %d)", jobCount, startID, endID)
 }
 
-func worker(client *http.Client, jobs <-chan DomainJob, semaphore chan struct{}, rateLimiter *time.Ticker, maxRetries int, wg *sync.WaitGroup) {
+func worker(client *http.Client, jobs <-chan DomainJob, semaphore chan struct{}, delayMs int, maxRetries int, wg *sync.WaitGroup) {
 \tdefer wg.Done()
+\trateLimiter := time.NewTicker(time.Duration(delayMs) * time.Millisecond)
+\tdefer rateLimiter.Stop()
 \tfor job := range jobs {
 \t\tsemaphore <- struct{}{}
 \t\t<-rateLimiter.C
@@ -369,6 +378,10 @@ def deploy(name, final_domains, args):
 
     ssh(f"sudo mkdir -p {remote_dir} && sudo chown {TARGET_USER}:{TARGET_USER} {remote_dir}")
 
+    extra_hosts = (
+        f'    extra_hosts:\n      - "domainscope.scrapetheworld.org:{API_HOST_IP}"\n'
+        if API_HOST_IP else ""
+    )
     compose = f"""\
 services:
   domain-processor:
@@ -380,7 +393,7 @@ services:
       - DELAY_MS={args.delay}
       - MAX_RETRIES={MAX_RETRIES}
       - DOMAIN_FILE=/app/domains.txt
-    volumes:
+{extra_hosts}    volumes:
       - ./domains.txt:/app/domains.txt
     logging:
       driver: "json-file"
